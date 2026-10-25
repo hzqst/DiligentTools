@@ -273,10 +273,11 @@ struct Material
 
     struct TextureShaderAttribs
     {
-        // [0:2] - UV selector
-        // [3:5] - U(S) wrap mode. 0 - Repeat, 1 - Mirror, 2 - Clamp
-        // [6:8] - V(T) wrap mode. 0 - Repeat, 1 - Mirror, 2 - Clamp
-        Uint32 PackedProps  = 0; // Default: UV Selector = -1, WrapU = WrapV = Repeat
+        // [0:2]  - UV selector
+        // [3:5]  - U(S) wrap mode. 0 - Repeat, 1 - Mirror, 2 - Clamp
+        // [6:8]  - V(T) wrap mode. 0 - Repeat, 1 - Mirror, 2 - Clamp
+        // [9:12] - Sampling mip level count, including the base level (1 through 15).
+        Uint32 PackedProps  = MipLevelCountShiftedMask; // Default: UV Selector = -1, WrapU = WrapV = Repeat, maximum mip count
         float  TextureSlice = 0;
         float  UBias        = 0;
         float  VBias        = 0;
@@ -301,6 +302,11 @@ struct Material
         static constexpr Uint32 WrapVBits        = 3;
         static constexpr Uint32 WrapVMask        = (1u << WrapVBits) - 1u;
         static constexpr Uint32 WrapVShiftedMask = WrapVMask << WrapVShift;
+
+        static constexpr Uint32 MipLevelCountShift       = WrapVShift + WrapVBits;
+        static constexpr Uint32 MipLevelCountBits        = 4;
+        static constexpr Uint32 MipLevelCountMask        = (1u << MipLevelCountBits) - 1u;
+        static constexpr Uint32 MipLevelCountShiftedMask = MipLevelCountMask << MipLevelCountShift;
 
         void SetUVSelector(int Selector)
         {
@@ -337,8 +343,55 @@ struct Material
         {
             return static_cast<TEXTURE_ADDRESS_MODE>(((PackedProps >> WrapVShift) & WrapVMask) + 1u);
         }
+
+        /// Sets the sampling mip level count, including the base level.
+        /// The count must be between 1 and 15. The default maximum count adds
+        /// no sampling restriction beyond the texture and atlas region limits.
+        void SetMipLevelCount(Uint32 MipLevelCount)
+        {
+            VERIFY_EXPR(MipLevelCount != 0 && MipLevelCount <= MipLevelCountMask);
+            PackedProps &= ~MipLevelCountShiftedMask;
+            PackedProps |= (MipLevelCount & MipLevelCountMask) << MipLevelCountShift;
+        }
+
+        /// Returns the sampling mip level count, including the base level.
+        Uint32 GetMipLevelCount() const
+        {
+            return (PackedProps >> MipLevelCountShift) & MipLevelCountMask;
+        }
     };
     static_assert(sizeof(TextureShaderAttribs) % 16 == 0, "TextureShaderAttribs struct must be 16-byte aligned");
+
+    /// Shader attributes and retained UV transform components for a material texture.
+    struct TextureAttribs
+    {
+        /// Attributes used for rendering. Direct matrix edits do not update UVScale or UVRotation.
+        TextureShaderAttribs ShaderAttribs;
+
+        /// UV scale retained by the loader or SetUVTransform().
+        float2 UVScale{1, 1};
+
+        /// Counter-clockwise UV rotation in radians. Angles are not wrapped.
+        float UVRotation = 0;
+
+        /// Sets the complete UV transform: scale, counter-clockwise rotation in radians,
+        /// then offset. The offset is stored in ShaderAttribs.UBias/VBias.
+        void SetUVTransform(const float2& Scale, float Rotation, const float2& Offset)
+        {
+            UVScale    = Scale;
+            UVRotation = Rotation;
+
+            ShaderAttribs.UBias = Offset.x;
+            ShaderAttribs.VBias = Offset.y;
+
+            ShaderAttribs.UVScaleAndRotation = float2x2::Scale(Scale.x, Scale.y);
+            if (Rotation != 0)
+            {
+                // UV rotation is counter-clockwise, which rotates the image clockwise.
+                ShaderAttribs.UVScaleAndRotation *= float2x2::Rotation(-Rotation);
+            }
+        }
+    };
 
 private:
     // Texture indices in Model.Textures array, for each attribute.
@@ -358,7 +411,7 @@ private:
     //
     std::unique_ptr<int[]> TextureIds;
 
-    std::unique_ptr<TextureShaderAttribs[]> TextureAttribs;
+    std::unique_ptr<TextureAttribs[]> TextureAttributes;
 
     Uint32 ActiveTextureAttribs = 0;
 
@@ -415,16 +468,28 @@ public:
         TextureIds[GetActiveTextureAttribPackedIndex(Idx)] = TextureId;
     }
 
-    TextureShaderAttribs& GetTextureAttrib(Uint32 Idx)
+    /// Returns the complete attributes for an active texture attribute.
+    TextureAttribs& GetTextureAttrib(Uint32 Idx)
     {
-        return TextureAttribs[GetActiveTextureAttribPackedIndex(Idx)];
-    }
-    const TextureShaderAttribs& GetTextureAttrib(Uint32 Idx) const
-    {
-        static constexpr TextureShaderAttribs DefaultAttribs{};
-        return IsTextureAttribActive(Idx) ? TextureAttribs[GetActiveTextureAttribPackedIndex(Idx)] : DefaultAttribs;
+        return TextureAttributes[GetActiveTextureAttribPackedIndex(Idx)];
     }
 
+    /// Returns the complete texture attributes, or default attributes if Idx is inactive.
+    const TextureAttribs& GetTextureAttrib(Uint32 Idx) const
+    {
+        static constexpr TextureAttribs DefaultAttribs{};
+        return IsTextureAttribActive(Idx) ? TextureAttributes[GetActiveTextureAttribPackedIndex(Idx)] : DefaultAttribs;
+    }
+
+    /// Sets the complete UV transform: scale, counter-clockwise rotation in radians,
+    /// then offset. Idx must identify an active texture attribute.
+    void SetTextureUVTransform(Uint32 Idx, const float2& Scale, float Rotation, const float2& Offset)
+    {
+        TextureAttributes[GetActiveTextureAttribPackedIndex(Idx)].SetUVTransform(Scale, Rotation, Offset);
+    }
+
+    /// Calls Handler(attribute index, TextureAttribs&, texture ID) for each active
+    /// texture attribute in index order. Returning false stops the iteration.
     template <typename HandlerType>
     void ProcessActiveTextureAttibs(HandlerType&& Handler) const
     {
@@ -433,7 +498,7 @@ public:
         {
             const Uint32 Idx         = PlatformMisc::GetLSB(ActiveAttribs);
             const size_t PackedIndex = GetActiveTextureAttribPackedIndex(Idx);
-            if (!Handler(Idx, TextureAttribs[PackedIndex], TextureIds[PackedIndex]))
+            if (!Handler(Idx, TextureAttributes[PackedIndex], TextureIds[PackedIndex]))
                 break;
             ActiveAttribs &= ~(1u << Idx);
         }

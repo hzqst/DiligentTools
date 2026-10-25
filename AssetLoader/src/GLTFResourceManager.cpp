@@ -62,6 +62,7 @@ ResourceManager::ResourceManager(IReferenceCounters* pRefCounters,
     m_DefaultVertPoolDesc{CI.DefaultPoolDesc},
     m_DefaultAtlasName{CI.DefaultAtlasDesc.Desc.Name != nullptr ? CI.DefaultAtlasDesc.Desc.Name : "GLTF texture atlas"},
     m_DefaultAtlasDesc{CI.DefaultAtlasDesc},
+    m_DefaultAtlasMipLevel0Size{CI.DefaultAtlasMipLevel0Size},
     m_IndexAllocatorCI{CI.IndexAllocatorCI},
     m_TexAllocations{CI.NumTextureAllocationShards != 0 ? CI.NumTextureAllocationShards : 1}
 {
@@ -246,7 +247,7 @@ RefCntAutoPtr<ITextureAtlasSuballocation> ResourceManager::AllocateTextureSpace(
                 }
 
                 DynamicTextureAtlasCreateInfo AtalsCreateInfo = m_DefaultAtlasDesc;
-                AtalsCreateInfo.Desc.Format                   = Fmt;
+                AtalsCreateInfo.Desc                          = GetDefaultAtlasDesc(Fmt);
 
                 CreateDynamicTextureAtlas(nullptr, AtalsCreateInfo, &pAtlas);
                 if (pAtlas)
@@ -333,33 +334,79 @@ RefCntAutoPtr<IBufferSuballocator> ResourceManager::CreateIndexBufferAllocator(I
 
 RefCntAutoPtr<IBufferSuballocation> ResourceManager::AllocateIndices(Uint32 Size, Uint32 Alignment)
 {
-    RefCntAutoPtr<IBufferSuballocation> pIndices;
-    for (Uint32 AllocatorIdx = 0; !pIndices; ++AllocatorIdx)
+    if (Size == 0 || !IsPowerOfTwo(Alignment))
+    {
+        LOG_ERROR_MESSAGE("Index allocation size must be non-zero and alignment must be a power of two");
+        return {};
+    }
+
+    // Match the suballocator's effective limit: zero MaxSize keeps the initial
+    // size, and a smaller MaxSize does not reduce the initial capacity.
+    const Uint64 MaxSize     = std::max(m_IndexAllocatorCI.Desc.Size, m_IndexAllocatorCI.MaxSize);
+    const Uint64 AlignedSize = AlignUp(Uint64{Size}, Uint64{Alignment});
+    if (AlignedSize > MaxSize)
+    {
+        LOG_ERROR_MESSAGE("Index allocation size ", AlignedSize, " exceeds maximum buffer size ", MaxSize);
+        return {};
+    }
+
+    RefCntAutoPtr<IBufferSuballocator>  pNewAllocator;
+    RefCntAutoPtr<IBufferSuballocation> pNewIndices;
+    for (Uint32 AllocatorIdx = 0;;)
     {
         IBufferSuballocator* pAllocator = nullptr;
         {
             std::shared_lock<Threading::SharedMutex> SharedLock{m_IndexAllocatorsMtx};
             if (AllocatorIdx < m_IndexAllocators.size())
-                pAllocator = m_IndexAllocators[AllocatorIdx];
+            {
+                pAllocator = m_IndexAllocators[AllocatorIdx++];
+                if (pAllocator == nullptr)
+                    return {};
+            }
         }
 
-        if (pAllocator == nullptr)
+        if (pAllocator != nullptr)
+        {
+            // Published allocators remain owned by the manager, so their pointers
+            // stay valid after unlocking even if another thread grows the vector.
+            RefCntAutoPtr<IBufferSuballocation> pIndices;
+            pAllocator->Allocate(Size, Alignment, &pIndices);
+            if (pIndices)
+                return pIndices;
+
+            continue;
+        }
+
+        if (!pNewAllocator)
+        {
+            // Prepare one private candidate without holding the allocator-list
+            // mutex. Retain it while checking allocators published by other threads.
+            pNewAllocator = CreateIndexBufferAllocator(nullptr);
+            if (!pNewAllocator)
+                return {};
+
+            pNewAllocator->Allocate(Size, Alignment, &pNewIndices);
+            if (!pNewIndices)
+            {
+                // Failure in an empty allocator cannot be resolved by creating
+                // more identical allocators.
+                LOG_ERROR_MESSAGE("Failed to allocate ", Size, " bytes in a new index buffer");
+                return {};
+            }
+        }
+
         {
             std::unique_lock<Threading::SharedMutex> UniqueLock{m_IndexAllocatorsMtx};
-            if (AllocatorIdx == m_IndexAllocators.size())
-            {
-                m_IndexAllocators.emplace_back(CreateIndexBufferAllocator(nullptr));
-            }
-            pAllocator = m_IndexAllocators[AllocatorIdx];
+            // Another thread may have published an allocator while we prepared
+            // the candidate. Try those new entries first, keeping AllocatorIdx
+            // unchanged so concurrent requests can share their remaining space.
+            if (AllocatorIdx < m_IndexAllocators.size())
+                continue;
+
+            m_IndexAllocators.emplace_back(std::move(pNewAllocator));
         }
-
-        if (pAllocator == nullptr)
-            break;
-
-        pAllocator->Allocate(Size, Alignment, &pIndices);
+        return pNewIndices;
     }
-
-    return pIndices;
 }
 
 RefCntAutoPtr<IBufferSuballocation> ResourceManager::AllocateMorphTargetData(Uint32 Size, Uint32 Alignment)
@@ -676,10 +723,37 @@ ITexture* ResourceManager::GetTexture(TEXTURE_FORMAT Fmt) const
 
 void ResourceManager::UpdateAllResources(IRenderDevice* pDevice, IDeviceContext* pContext)
 {
-    UpdateIndexBuffer(pDevice, pContext);
+    UpdateIndexBuffers(pDevice, pContext);
     UpdateMorphTargetBuffer(pDevice, pContext);
     UpdateVertexBuffers(pDevice, pContext);
     UpdateTextures(pDevice, pContext);
+}
+
+TextureDesc ResourceManager::GetDefaultAtlasDesc(TEXTURE_FORMAT Fmt) const
+{
+    TextureDesc Desc = m_DefaultAtlasDesc.Desc;
+    Desc.Format      = Fmt;
+
+    if (m_DefaultAtlasMipLevel0Size == 0 || Fmt == TEX_FORMAT_UNKNOWN ||
+        Desc.Width == 0 || Desc.Height == 0 || Desc.Type == RESOURCE_DIM_UNDEFINED)
+        return Desc;
+
+    constexpr Uint32 MinAtlasDimension = 16;
+
+    Uint32& Width  = Desc.Width;
+    Uint32& Height = Desc.Height;
+    while ((Width > MinAtlasDimension || Height > MinAtlasDimension) &&
+           GetMipLevelProperties(Width, Height, 1, Fmt, 0).MipSize > m_DefaultAtlasMipLevel0Size)
+    {
+        if (Width > MinAtlasDimension)
+            Width = std::max(Width / 2u, MinAtlasDimension);
+        if (Height > MinAtlasDimension)
+            Height = std::max(Height / 2u, MinAtlasDimension);
+
+        // The reduced atlas cannot have more mip levels than its full mip chain.
+        Desc.MipLevels = std::min(Desc.MipLevels, ComputeMipLevelsCount(Width, Height));
+    }
+    return Desc;
 }
 
 TextureDesc ResourceManager::GetAtlasDesc(TEXTURE_FORMAT Fmt)
@@ -693,9 +767,7 @@ TextureDesc ResourceManager::GetAtlasDesc(TEXTURE_FORMAT Fmt)
     }
 
     // Atlas is not present in the map - use default description
-    TextureDesc Desc = m_DefaultAtlasDesc.Desc;
-    Desc.Format      = Fmt;
-    return Desc;
+    return GetDefaultAtlasDesc(Fmt);
 }
 
 Uint32 ResourceManager::GetAllocationAlignment(TEXTURE_FORMAT Fmt, Uint32 Width, Uint32 Height)
